@@ -1,0 +1,43 @@
+# tick-crawler — runs on the datalake VM (same host as ClickHouse).
+#
+# No VPN needed: Binance futures trade streams (@aggTrade) work directly via the
+# /market WS route; order book (@depth) via the unrouted/Public route. Host networking
+# reaches ClickHouse at 127.0.0.1.
+#
+# Two instances: `crawler` = USDM futures (demo + PAXG/XAUT via EXTRA_SYMBOLS),
+#                `crawler-spot` = spot for the gold tokens (trades + order book + ohlcv).
+
+services:
+  crawler:                      # USDM futures
+    build: .
+    container_name: tc-crawler
+    restart: unless-stopped
+    network_mode: host          # reach ClickHouse at 127.0.0.1 (datalake VM)
+    env_file: .env              # MARKET_TYPE=um, EXTRA_SYMBOLS=PAXGUSDT,XAUTUSDT, CH_PASSWORD…
+    environment:
+      DEMO_SYMBOLS_JSON: /data/symbols.json   # SYMBOLS_SCOPE=demo reads this (mounted below)
+    volumes:                    # demo universe lives outside the build context -> mount it
+      - ../../../demo/pairs-research/data/symbols.json:/data/symbols.json:ro
+    command: python -m live.main
+    # live.main (futures): order book + trades (WS @aggTrade /market) + ohlcv (all intervals,
+    # closed) + open_interest & funding_rate (real-time) + futures_metrics (5m).
+
+  crawler-spot:                 # spot (gold tokens)
+    build: .
+    container_name: tc-crawler-spot
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      MARKET_TYPE: spot
+      SYMBOLS_SCOPE: PAXGUSDT,XAUTUSDT
+      EXTRA_SYMBOLS: ""
+    command: python -m live.main
+    # spot: order book + trades (WS) + ohlcv (incl 1s). No OI/funding/metrics (futures-only).
+
+# one-off setup (run once):
+#   docker compose run --rm crawler python migrate.py --recreate     # create 5 new tables (CODECs)
+#   docker compose run --rm crawler python symbol_info.py            # metadata: futures universe
+#   docker compose run --rm crawler-spot python symbol_info.py       # metadata: spot gold tokens
+#   docker compose run --rm crawler python -m backfill.main          # futures history (Vision)
+#   docker compose run --rm crawler-spot python -m backfill.main     # spot history (trades only)
