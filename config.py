@@ -22,9 +22,7 @@ CH_DATABASE = os.getenv("CH_DATABASE", "crypto")
 EXCHANGE = os.getenv("EXCHANGE", "binance")
 MARKET_TYPE = os.getenv("MARKET_TYPE", "um")
 
-SYMBOLS_SCOPE = os.getenv("SYMBOLS_SCOPE", "demo")
-# Always-include symbols appended to the resolved universe (e.g. gold tokens on futures).
-EXTRA_SYMBOLS = [s.strip().upper() for s in os.getenv("EXTRA_SYMBOLS", "").split(",") if s.strip()]
+# Which pairs each market collects now lives in pairs.yaml (see symbols.resolve).
 DATASETS = [d.strip() for d in os.getenv("DATASETS", "trades,bookDepth,metrics").split(",") if d.strip()]
 
 WORKERS = int(os.getenv("WORKERS", "8"))

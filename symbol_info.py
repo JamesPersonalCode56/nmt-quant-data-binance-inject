@@ -4,8 +4,8 @@ One row per symbol for the universe this instance crawls (MARKET_TYPE fixes spot
 futures). symbol_info is a static-metadata table (ReplacingMergeTree keyed by
 exchange,market_type,symbol -> one current row per symbol); re-running just refreshes it.
 
-Usage:  python symbol_info.py                       # futures: demo + EXTRA_SYMBOLS
-        MARKET_TYPE=spot python symbol_info.py --symbols PAXGUSDT,XAUTUSDT
+Usage:  python symbol_info.py                       # futures: pairs.yaml markets.um
+        MARKET_TYPE=spot python symbol_info.py      # spot: pairs.yaml markets.spot
 """
 from __future__ import annotations
 

@@ -4,8 +4,8 @@
 # /market WS route; order book (@depth) via the unrouted/Public route. Host networking
 # reaches ClickHouse at 127.0.0.1.
 #
-# Two instances: `crawler` = USDM futures (demo + PAXG/XAUT via EXTRA_SYMBOLS),
-#                `crawler-spot` = spot for the gold tokens (trades + order book + ohlcv).
+# Two instances: `crawler` = USDM futures, `crawler-spot` = spot for the gold tokens.
+# Which pairs each one collects is declared in pairs.yaml (markets.um / markets.spot).
 
 services:
   crawler:                      # USDM futures
@@ -13,9 +13,9 @@ services:
     container_name: tc-crawler
     restart: unless-stopped
     network_mode: host          # reach ClickHouse at 127.0.0.1 (datalake VM)
-    env_file: .env              # MARKET_TYPE=um, EXTRA_SYMBOLS=PAXGUSDT,XAUTUSDT, CH_PASSWORD…
+    env_file: .env              # MARKET_TYPE=um, CH_PASSWORD…
     environment:
-      DEMO_SYMBOLS_JSON: /data/symbols.json   # SYMBOLS_SCOPE=demo reads this (mounted below)
+      DEMO_SYMBOLS_JSON: /data/symbols.json   # pairs.yaml demo universe reads this (mounted below)
     volumes:                    # demo universe lives outside the build context -> mount it
       - ../../../demo/pairs-research/data/symbols.json:/data/symbols.json:ro
     command: python -m live.main
@@ -29,9 +29,7 @@ services:
     network_mode: host
     env_file: .env
     environment:
-      MARKET_TYPE: spot
-      SYMBOLS_SCOPE: PAXGUSDT,XAUTUSDT
-      EXTRA_SYMBOLS: ""
+      MARKET_TYPE: spot         # pairs from pairs.yaml -> markets.spot
     command: python -m live.main
     # spot: order book + trades (WS) + ohlcv (incl 1s). No OI/funding/metrics (futures-only).
 

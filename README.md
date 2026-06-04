@@ -14,13 +14,18 @@ giờ `ALTER`** bảng cũ.
 > thẳng từ VN, **không cần VPN** (route `/market`).
 
 ## Hai instance (MARKET_TYPE cố định venue cho cả process)
-| Instance | `MARKET_TYPE` | Symbol | Thu thập |
+| Instance | `MARKET_TYPE` | Symbol (khai báo trong `pairs.yaml`) | Thu thập |
 |---|---|---|---|
-| futures | `um` (mặc định) | demo (44) + `EXTRA_SYMBOLS` (PAXG/XAUT) | order book, trades, ohlcv, **open_interest, funding_rate, metrics** |
-| spot | `spot` | PAXGUSDT, XAUTUSDT | order book, trades, ohlcv (có cả `1s`) |
+| futures | `um` (mặc định) | `markets.um`: scope `demo` (~46) + extra PAXG/XAUT | order book, trades, ohlcv, **open_interest, funding_rate, metrics** |
+| spot | `spot` | `markets.spot`: PAXGUSDT, XAUTUSDT | order book, trades, ohlcv (có cả `1s`) |
 
 OI / funding / long-short metrics là **futures-only** (Binance không cung cấp cho spot) → instance
 spot tự bỏ qua. Cả hai ghi chung bảng, phân biệt bằng cột `market_type`.
+
+> **Đổi cặp thu thập:** sửa `pairs.yaml` (`markets.<um|spot>.scope` / `.extra`) — **không** còn
+> `SYMBOLS_SCOPE`/`EXTRA_SYMBOLS` trong env. `scope` nhận: tên universe (`demo`/`core`), `all`
+> (mọi cặp USDT trên venue), hoặc list cụ thể. `MARKET_TYPE` chỉ chọn venue + section YAML.
+> Override 1 lần chạy: cờ `--symbols`.
 
 ## Cài & chạy
 ```bash
@@ -30,18 +35,36 @@ cp .env.example .env                 # điền CH_PASSWORD
 
 poetry run python migrate.py --recreate   # tạo 5 bảng tick mới (kèm CODEC nén)
 poetry run python symbol_info.py          # điền metadata symbol_info (futures universe)
-MARKET_TYPE=spot SYMBOLS_SCOPE=PAXGUSDT,XAUTUSDT EXTRA_SYMBOLS= \
-  poetry run python symbol_info.py        # metadata cho spot
+MARKET_TYPE=spot poetry run python symbol_info.py   # metadata cho spot (cặp lấy từ pairs.yaml)
 
 # Backfill lịch sử (idempotent qua ingest_state + ReplacingMergeTree)
 poetry run python -m backfill.main                        # futures, range trong .env
-MARKET_TYPE=spot poetry run python -m backfill.main --symbols PAXGUSDT,XAUTUSDT  # spot (chỉ trades)
+MARKET_TYPE=spot poetry run python -m backfill.main       # spot (cặp từ pairs.yaml, chỉ trades)
 
 # Live 24/7
 poetry run python -m live.main                            # futures: đủ 5 nguồn
-MARKET_TYPE=spot poetry run python -m live.main --symbols PAXGUSDT,XAUTUSDT --groups 1  # spot
+MARKET_TYPE=spot poetry run python -m live.main --groups 1   # spot (cặp từ pairs.yaml)
 # smoke: thêm --seconds 60
 ```
+
+### Backfill định kỳ — chạy bao lâu một lần (QUAN TRỌNG)
+
+Live **không** thay thế được backfill. Hai thứ chỉ backfill mới có:
+- **`book_depth`** (±1..5% depth, mỗi 5s) — **không có nguồn live**, chỉ Vision cấp. Không backfill ⇒ bảng này **rỗng vĩnh viễn**.
+- **Lịch sử trước khi live khởi động** + `trades` full per-trade id (live chỉ có aggTrade từ lúc bật).
+
+`data.binance.vision` xuất file **theo ngày, trễ ~1–2 ngày**. Backfill **idempotent** (skip task `done` trong `ingest_state` + ReplacingMergeTree dedupe), nên chạy lại rất rẻ — chỉ tải phần còn thiếu.
+
+**Khuyến nghị: chạy backfill HẰNG NGÀY** cho cửa sổ trailing vài ngày (bù độ trễ Vision), tối thiểu **hàng tuần** nếu không cần `book_depth` liên tục. Ví dụ cron (chạy 06:00 mỗi ngày, backfill 3 ngày gần nhất):
+
+```bash
+# crontab -e
+0 6 * * * cd /…/HFT/research/data/tick-crawler && \
+  START_DATE=$(date -u -d '3 days ago' +\%F) END_DATE=$(date -u -d '1 day ago' +\%F) \
+  poetry run python -m backfill.main >> backfill.log 2>&1
+```
+
+> Lần đầu (điền lịch sử): bỏ `START_DATE/END_DATE` để dùng mặc định **30 ngày gần nhất** trong `config.backfill_range()`. Lưu ý dung lượng: 1 ngày `trades` BTCUSDT ~1.7M dòng.
 
 ## Docker Compose (2 service, KHÔNG cần VPN)
 ```bash

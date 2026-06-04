@@ -12,7 +12,7 @@ MARKET_TYPE: `um` (USDM futures, default) or `spot`.
   * metrics    : ONE REST poller (futures only) -> futures_metrics (long/short ratios, 5m)
 
 Usage:
-  python -m live.main                                   # demo + EXTRA_SYMBOLS, run forever
+  python -m live.main                                   # pairs from pairs.yaml, run forever
   python -m live.main --symbols BTCUSDT,ETHUSDT --seconds 60   # smoke test
   python -m live.main --groups 3 --no-trades --no-klines
   MARKET_TYPE=spot python -m live.main --symbols PAXGUSDT,XAUTUSDT   # spot instance

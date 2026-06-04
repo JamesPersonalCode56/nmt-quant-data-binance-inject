@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Trading pairs each crawler instance collects.
+#
+# A process picks its section via the MARKET_TYPE env var (`um` | `spot`); that
+# var also selects the venue's REST/WS endpoints, so it stays in .env. Everything
+# about *which pairs* lives here — there is no SYMBOLS_SCOPE / EXTRA_SYMBOLS env.
+#
+#   scope : a named universe (see `universes`), the literal `all` (every TRADING
+#           USDT pair on the venue), or an explicit list of symbols.
+#   extra : always-appended symbols (e.g. gold tokens), deduped after mapping.
+#
+# A symbol is kept only if it maps to a tradable pair on the venue (futures also
+# resolves the `1000x` perp names, e.g. PEPEUSDT -> 1000PEPEUSDT); others drop.
+# Override the active scope for a single run with the `--symbols` CLI flag.
+# ─────────────────────────────────────────────────────────────────────────────
+
+markets:
+  um:                                 # USDM perpetuals — the HFT research venue
+    scope: demo
+    extra: [PAXGUSDT, XAUTUSDT]       # gold tokens, always included
+  spot:                               # spot venue — only the gold tokens
+    scope: demo
+    extra: [PAXGUSDT, XAUTUSDT]
+
+universes:
+  core:                               # symbols hardcoded in the demo strategies
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - XRPUSDT
+    - ADAUSDT
+    - AVAXUSDT
+    - DOGEUSDT
+    - LINKUSDT
+    - 1000PEPEUSDT
+  demo:                               # external HFT research universe (top-50)
+    # Path is relative to this file. Override with DEMO_SYMBOLS_JSON for
+    # container mounts (e.g. /data/symbols.json).
+    file: ../../../demo/pairs-research/data/symbols.json

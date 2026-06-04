@@ -1,30 +1,79 @@
-"""Resolve the symbol universe to crawl.
+"""Resolve the symbol universe to crawl, from ``pairs.yaml``.
 
-demo  -> HFT/demo pairs-research universe (top-50) intersected with live USDM
-         perpetuals, mapping spot->futures '1000x' names (PEPEUSDT -> 1000PEPEUSDT).
-core  -> the symbols hardcoded in the demo strategies.
-all   -> every USDM perpetual USDT, status TRADING.
-csv   -> an explicit comma-separated list (validated against USDM perps).
+Which pairs each instance collects is declared in ``pairs.yaml`` (one section per
+MARKET_TYPE). For the active market this module expands its ``scope`` into the
+concrete, venue-valid symbol list:
+
+    scope = <named universe>  -> ``universes.<name>`` (inline list, or an external
+                                 json via ``{file: ...}``)
+    scope = "all"             -> every TRADING USDT pair on the venue
+    scope = [SYM, ...] / csv  -> an explicit list (csv form comes from --symbols)
+
+then appends ``extra`` and keeps only symbols tradable on the venue (futures also
+maps the ``1000x`` perp names, e.g. PEPEUSDT -> 1000PEPEUSDT).
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
-import functools
 
 import requests
+import yaml
 
 import config
 
-# Demo universe file. Override with DEMO_SYMBOLS_JSON (e.g. inside Docker, where the
-# HFT/demo tree lives outside the build context and is mounted to a fixed path).
-_DEMO_SYMBOLS_JSON = os.getenv("DEMO_SYMBOLS_JSON") or os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..",
-                 "demo", "pairs-research", "data", "symbols.json")
-)
 
-CORE = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-        "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "1000PEPEUSDT"]
+def _pairs_path() -> str:
+    """Location of pairs.yaml (override with PAIRS_CONFIG; default: next to this file)."""
+    return os.getenv("PAIRS_CONFIG") or os.path.join(os.path.dirname(__file__), "pairs.yaml")
+
+
+@functools.lru_cache(maxsize=1)
+def _load_pairs() -> dict:
+    with open(_pairs_path()) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data.get("markets"), dict):
+        raise ValueError(f"{_pairs_path()}: missing or invalid 'markets' section")
+    return data
+
+
+def _market_config(market: str) -> dict:
+    markets = _load_pairs()["markets"]
+    if market not in markets:
+        raise KeyError(
+            f"pairs.yaml has no section for MARKET_TYPE={market!r} (have: {sorted(markets)})"
+        )
+    return markets[market] or {}
+
+
+def _demo_file_path(rel: str) -> str:
+    """Resolve a universe's external json. DEMO_SYMBOLS_JSON overrides the path
+    (container mounts); otherwise it is taken relative to pairs.yaml."""
+    env = os.getenv("DEMO_SYMBOLS_JSON")
+    if env:
+        return env
+    return os.path.abspath(os.path.join(os.path.dirname(_pairs_path()), rel))
+
+
+def _named_universe(name: str, spec) -> list[str]:
+    if isinstance(spec, list):                       # inline list (e.g. core)
+        return [str(s).strip().upper() for s in spec if str(s).strip()]
+    if isinstance(spec, dict) and "file" in spec:    # external json (e.g. demo)
+        with open(_demo_file_path(spec["file"])) as f:
+            return [s["symbol"] for s in json.load(f)["symbols"]]
+    raise ValueError(f"universe '{name}' must be a list or a {{file: <path>}} mapping")
+
+
+def _expand_scope(scope) -> list[str]:
+    """A scope -> a raw symbol list (before venue mapping). 'all' is handled by resolve()."""
+    if isinstance(scope, (list, tuple)):             # explicit list from yaml
+        return [str(s).strip().upper() for s in scope if str(s).strip()]
+    scope = str(scope).strip()
+    universes = _load_pairs().get("universes", {})
+    if scope in universes:
+        return _named_universe(scope, universes[scope])
+    return [s.strip().upper() for s in scope.split(",") if s.strip()]  # csv (e.g. --symbols)
 
 
 @functools.lru_cache(maxsize=1)
@@ -55,25 +104,22 @@ def _map_to_market(sym: str, valid: frozenset[str]) -> str | None:
     return None
 
 
-def _demo_universe() -> list[str]:
-    with open(_DEMO_SYMBOLS_JSON) as f:
-        return [s["symbol"] for s in json.load(f)["symbols"]]
+def resolve(scope: str | list | None = None) -> list[str]:
+    """Resolve the crawl list for the active MARKET_TYPE.
 
-
-def resolve(scope: str | None = None) -> list[str]:
-    scope = (scope or config.SYMBOLS_SCOPE).strip()
+    `scope` defaults to ``pairs.yaml`` -> markets.<MARKET_TYPE>.scope; pass a value
+    (e.g. the ``--symbols`` CLI flag) to override it for one run. The market's
+    ``extra`` symbols are always appended.
+    """
+    mcfg = _market_config(config.MARKET_TYPE)
     valid = market_symbol_set()
+    if scope is None:
+        scope = mcfg.get("scope")
 
     if scope == "all":
         return sorted(valid)
 
-    if scope == "core":
-        raw = CORE
-    elif scope == "demo":
-        raw = _demo_universe()
-    else:  # explicit csv list
-        raw = [s.strip().upper() for s in scope.split(",") if s.strip()]
-    raw = list(raw) + config.EXTRA_SYMBOLS   # always-include extras (e.g. gold tokens)
+    raw = _expand_scope(scope) + [str(s).strip().upper() for s in (mcfg.get("extra") or [])]
 
     out, seen = [], set()
     for s in raw:
@@ -86,5 +132,5 @@ def resolve(scope: str | None = None) -> list[str]:
 
 if __name__ == "__main__":
     syms = resolve()
-    print(f"scope={config.SYMBOLS_SCOPE} -> {len(syms)} symbols")
+    print(f"market={config.MARKET_TYPE} -> {len(syms)} symbols")
     print(" ".join(syms))
