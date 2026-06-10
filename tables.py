@@ -31,6 +31,11 @@ METRICS_COLS = [
 INGEST_STATE_COLS = [
     "dataset", "symbol", "date", "status", "rows", "bytes", "sha256", "updated_at",
 ]
+LIQUIDATIONS_COLS = [
+    "exchange", "market_type", "symbol", "side", "order_type", "time_in_force",
+    "orig_qty", "price", "avg_price", "status", "last_filled_qty", "filled_qty",
+    "trade_ts", "source_ts", "ingested_at", "extra",
+]
 # ---- insert column orders for the PRE-EXISTING tables we now populate ----
 OHLCV_COLS = [
     "exchange", "market_type", "symbol", "interval", "ts_open", "open", "high", "low",
@@ -152,6 +157,31 @@ CREATE TABLE IF NOT EXISTS crypto.ingest_state
 )
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (dataset, symbol, date)
+SETTINGS index_granularity = 8192
+""",
+    "liquidations": """
+CREATE TABLE IF NOT EXISTS crypto.liquidations
+(
+    exchange        LowCardinality(String),
+    market_type     Enum8('spot'=1,'um'=2,'cm'=3),
+    symbol          LowCardinality(String),
+    side            Enum8('buy'=1,'sell'=2),
+    order_type      LowCardinality(String),
+    time_in_force   LowCardinality(String),
+    orig_qty        Decimal(38,18)    CODEC(ZSTD(1)),
+    price           Decimal(38,18)    CODEC(ZSTD(1)),
+    avg_price       Decimal(38,18)    CODEC(ZSTD(1)),
+    status          LowCardinality(String),
+    last_filled_qty Decimal(38,18)    CODEC(ZSTD(1)),
+    filled_qty      Decimal(38,18)    CODEC(ZSTD(1)),
+    trade_ts        DateTime64(3,'UTC') CODEC(DoubleDelta, ZSTD(1)),
+    source_ts       DateTime64(3,'UTC') CODEC(DoubleDelta, ZSTD(1)),
+    ingested_at     DateTime64(3,'UTC') CODEC(DoubleDelta, ZSTD(1)),
+    extra           Map(String,String)
+)
+ENGINE = ReplacingMergeTree(ingested_at)
+PARTITION BY toYYYYMMDD(trade_ts)
+ORDER BY (exchange, market_type, symbol, trade_ts, side, price, orig_qty)
 SETTINGS index_granularity = 8192
 """,
 }

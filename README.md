@@ -1,13 +1,13 @@
 # tick-crawler — Binance tick + market data → ClickHouse (`crypto`)
 
 Kéo dữ liệu Binance (**USDM futures** + **spot**) cho HFT vào warehouse ClickHouse dùng chung
-(`crypto`). Điền **toàn bộ 9 bảng**: 5 bảng tick mới + 4 bảng cũ (`symbol_info`, `ohlcv`,
+(`crypto`). Điền **toàn bộ 10 bảng**: 6 bảng tick mới + 4 bảng cũ (`symbol_info`, `ohlcv`,
 `open_interest`, `funding_rate`) — bằng `CREATE … IF NOT EXISTS` và `populate`, **không bao
 giờ `ALTER`** bảng cũ.
 
 - **Backfill (quá khứ)** — `data.binance.vision`: futures `trades`/`bookDepth`/`metrics`; spot `trades`.
 - **Live (real-time)** — WebSocket order book + `@aggTrade` + `@kline` (mọi khung, nến đã đóng)
-  + REST open-interest/funding-rate + REST long/short metrics.
+  + `!forceOrder@arr` (thanh lý toàn thị trường) + REST open-interest/funding-rate + REST long/short metrics.
 
 > Dependency manager: **Poetry**, virtualenv **in-project** (`.venv/`). Chạy **cùng máy với
 > ClickHouse** (endpoint tự nhận `127.0.0.1`). Tune cho **8 CPU** dùng chung. Trades chạy
@@ -33,7 +33,7 @@ cd HFT/research/data/tick-crawler
 poetry install                       # tạo .venv/ + cài deps
 cp .env.example .env                 # điền CH_PASSWORD
 
-poetry run python migrate.py --recreate   # tạo 5 bảng tick mới (kèm CODEC nén)
+poetry run python migrate.py --recreate   # tạo 6 bảng tick mới (kèm CODEC nén)
 poetry run python symbol_info.py          # điền metadata symbol_info (futures universe)
 MARKET_TYPE=spot poetry run python symbol_info.py   # metadata cho spot (cặp lấy từ pairs.yaml)
 
@@ -81,13 +81,14 @@ Cả hai `network_mode: host` (tới ClickHouse `127.0.0.1`). `crawler-spot` ove
 Auto-pick `CH_HOST`: `127.0.0.1` → `192.168.122.226` (NAT) → `100.115.36.121` (Tailscale);
 trên datalake VM chọn `127.0.0.1` ngay. Client HTTP 8124 (`clickhouse-connect`). Creds trong `.env`.
 
-## Bảng (`migrate.py` tạo 5 bảng mới; `symbol_info.py`/live điền 4 bảng cũ)
+## Bảng (`migrate.py` tạo 6 bảng mới; `symbol_info.py`/live điền 4 bảng cũ)
 | Bảng | Loại | Nguồn |
 |---|---|---|
 | `trades` | mới | Vision `trades` + live WS `@aggTrade` (`/market`); `extra.src`=`vision`/`ws_agg`/`rest_agg` |
 | `book_depth` | mới | Vision `bookDepth` (±1..5% mỗi 5s) |
 | `book_snapshot_l2` | mới | live WS `@depthN@100ms` (L2 top-N, mặc định 20) |
 | `futures_metrics` | mới | Vision `metrics` + live REST `/futures/data/*` (long/short ratios, 5m) |
+| `liquidations` | mới | live WS `!forceOrder@arr` (thanh lý cưỡng bức toàn thị trường, **futures-only**, route `/market`) |
 | `ingest_state` | mới | registry idempotent cho backfill |
 | **`symbol_info`** | cũ | `exchangeInfo` (tick/step/precision/notional/status…) — 1 dòng/symbol |
 | **`ohlcv`** | cũ | live WS `@kline_<iv>` **mọi khung, chỉ nến đã đóng** (`is_final=1`) |
@@ -109,7 +110,9 @@ Giảm ~50–60% so với LZ4 mặc định (vd `trade_id` từ 2.0x lên ~rất
 - **OI + funding** (futures): 1 REST poller mỗi `OI_FUNDING_SECS` (premiumIndex all-symbols 1 call + openInterest/symbol).
 - **Metrics** (futures): 1 REST poller `/futures/data/*` mỗi 5 phút.
 
-Cờ tắt từng phần: `--no-orderbook --no-trades --no-klines --no-oi-funding --no-metrics`.
+- **Liquidations** (futures): 1 WS `!forceOrder@arr` (route `/market`) — 1 connection phủ toàn thị trường, ~1–2 event/s, bỏ qua universe (cascade chéo symbol chính là tín hiệu).
+
+Cờ tắt từng phần: `--no-orderbook --no-trades --no-klines --no-oi-funding --no-metrics --no-liquidations`.
 
 ### Xoay vòng WebSocket 24h (không mất data)
 `live/wsmanager.py` dùng **make-before-break**: mở connection thay thế ~15s trước mốc 24h, chạy

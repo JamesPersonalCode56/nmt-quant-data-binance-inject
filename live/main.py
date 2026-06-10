@@ -115,6 +115,23 @@ def _run_klines(symbols: list[str], seconds: int) -> None:
         proxy=config.WS_PROXY, base=config.WS_MARKET_BASE))
 
 
+def _run_liquidations(seconds: int) -> None:
+    """All-market forced liquidations `!forceOrder@arr` -> crypto.liquidations (futures only).
+
+    One connection on the /market route covers the WHOLE futures market (cheap,
+    ~1-2 events/s), so it ignores the per-symbol universe on purpose — cross-symbol
+    liquidation cascades are themselves the signal. The Public route returns nothing
+    for this stream.
+    """
+    print(f"[liquidations pid={os.getpid()}] !forceOrder@arr (all-market)", flush=True)
+    asyncio.run(_ws_loop(
+        ["_"], seconds,                              # one dummy symbol -> a single stream
+        streams_for=lambda _s: ["!forceOrder@arr"],
+        table="liquidations", cols=tables.LIQUIDATIONS_COLS,
+        build=lambda d, st: parsers.liquidation_rows(d, now_utc()),
+        proxy=config.WS_PROXY, base=config.WS_MARKET_BASE))
+
+
 def _chunk(xs: list, n: int) -> list[list]:
     n = max(1, min(n, len(xs)))
     return [xs[i::n] for i in range(n)]
@@ -131,6 +148,7 @@ def main() -> None:
     ap.add_argument("--no-metrics", action="store_true")
     ap.add_argument("--no-oi-funding", action="store_true")
     ap.add_argument("--no-orderbook", action="store_true")
+    ap.add_argument("--no-liquidations", action="store_true")
     ap.add_argument("--rest-trades", action="store_true",
                     help="collect trades via REST pagination instead of WS @aggTrade")
     args = ap.parse_args()
@@ -141,6 +159,7 @@ def main() -> None:
     ws_trades = config.WS_TRADES and not args.rest_trades and not args.no_trades
     run_metrics = not args.no_metrics and not is_spot          # long/short ratios: futures only
     run_oi_funding = not args.no_oi_funding and not is_spot    # OI + funding: futures only
+    run_liquidations = not args.no_liquidations and not is_spot  # forced liquidations: futures only
     ob_groups = [g for g in _chunk(syms, args.groups) if g]
     kl_groups = [g for g in _chunk(syms, args.kline_groups) if g]
     print(f"market={config.MARKET_TYPE}  host={os.environ['CH_HOST']}  symbols={len(syms)}  "
@@ -148,6 +167,7 @@ def main() -> None:
           f"x{len(config.KLINE_INTERVALS)}iv  "
           f"trades={'ws' if ws_trades else ('rest' if not args.no_trades else 'off')}  "
           f"oi_funding={run_oi_funding}  metrics={run_metrics}  "
+          f"liquidations={run_liquidations}  "
           f"seconds={args.seconds or 'forever'}", flush=True)
 
     procs: list[mp.Process] = []
@@ -164,6 +184,8 @@ def main() -> None:
         procs.append(mp.Process(target=poll_oi_funding.run, args=(syms, args.seconds)))
     if run_metrics:
         procs.append(mp.Process(target=poll_metrics.run, args=(syms, args.seconds)))
+    if run_liquidations:                               # all-market !forceOrder@arr, /market route
+        procs.append(mp.Process(target=_run_liquidations, args=(args.seconds,)))
 
     for p in procs:
         p.start()
