@@ -65,3 +65,19 @@ def kline_rows(data: dict, ingested: datetime) -> list[tuple]:
         dec(k["v"]), dec(k["q"]), int(k["n"]), dec(k["V"]), dec(k["Q"]),
         1, ms_to_dt(data["E"]), ingested, {},
     )]
+
+
+def liquidation_rows(data: dict, ingested: datetime) -> list[tuple]:
+    """`!forceOrder@arr` / `<symbol>@forceOrder` payload -> crypto.liquidations rows.
+
+    Futures-only forced-liquidation feed (delivered on the /market route, same as
+    @aggTrade — the Public route returns nothing). `o['S']` is the liquidation
+    order side: SELL = a LONG was force-closed, BUY = a SHORT was force-closed.
+    """
+    o = data["o"]
+    return [(
+        EXC, MKT, o["s"], o["S"].lower(), o["o"], o["f"],
+        dec(o["q"]), dec(o["p"]), dec(o["ap"]), o["X"],
+        dec(o["l"]), dec(o["z"]),
+        ms_to_dt(o["T"]), ms_to_dt(data["E"]), ingested, {},
+    )]
