@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from datetime import date, timedelta
 
 import requests
@@ -12,6 +13,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # --- ClickHouse endpoint candidates, in preference order ------------------
 _HOST_CANDIDATES = ["127.0.0.1", "192.168.122.226", "100.115.36.121"]
+
+# A transient CH-unreachable at startup must NOT crash the process into a Docker
+# crash-loop: retry the /ping sweep for a bounded budget before giving up.
+_CH_RESOLVE_ATTEMPTS = 10        # sweeps over the candidate list
+_CH_RESOLVE_BACKOFF = 3.0        # seconds between sweeps (~30s total budget)
 
 CH_HTTP_PORT = int(os.getenv("CH_HTTP_PORT", "8124"))
 CH_NATIVE_PORT = int(os.getenv("CH_NATIVE_PORT", "9000"))
@@ -84,16 +90,23 @@ def _ping(host: str) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def resolve_ch_host() -> str:
-    """Return CH_HOST from env, else the first candidate that answers /ping (cached)."""
+    """Return CH_HOST from env, else the first candidate that answers /ping (cached).
+
+    Retries the /ping sweep with backoff so a transient CH-unreachable at startup
+    waits it out instead of crashing the process into a Docker crash-loop.
+    """
     env_host = os.getenv("CH_HOST", "").strip()
     if env_host:
         return env_host
-    for h in _HOST_CANDIDATES:
-        if _ping(h):
-            return h
+    for attempt in range(_CH_RESOLVE_ATTEMPTS):
+        for h in _HOST_CANDIDATES:
+            if _ping(h):
+                return h
+        if attempt < _CH_RESOLVE_ATTEMPTS - 1:
+            time.sleep(_CH_RESOLVE_BACKOFF)
     raise RuntimeError(
-        f"No reachable ClickHouse on :{CH_HTTP_PORT} among {_HOST_CANDIDATES}. "
-        "Set CH_HOST in .env."
+        f"No reachable ClickHouse on :{CH_HTTP_PORT} among {_HOST_CANDIDATES} "
+        f"after {_CH_RESOLVE_ATTEMPTS} attempts. Set CH_HOST in .env."
     )
 
 

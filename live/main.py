@@ -24,6 +24,7 @@ import asyncio
 import json
 import multiprocessing as mp
 import os
+import time
 
 import ch
 import config
@@ -31,6 +32,15 @@ import symbols as symmod
 import tables
 from live import parsers, poll_metrics, poll_oi_funding, poll_trades, wsmanager
 from util import now_utc
+
+FLUSH_RETRIES = 4            # CH insert attempts before a flush is deemed unrecoverable
+FLUSH_RETRY_BACKOFF = 1.0    # seconds, multiplied by attempt number (1s, 2s, 3s)
+
+# Supervisor: re-spawn dead workers (run-forever mode only) with bounded backoff.
+SUPERVISE_POLL = 3.0         # seconds between liveness sweeps
+RESPAWN_BACKOFF_START = 1.0  # initial per-slot backoff after a crash
+RESPAWN_BACKOFF_CAP = 30.0   # max per-slot backoff
+RESPAWN_BACKOFF_RESET = 60.0 # a slot alive this long resets its backoff to START
 
 
 async def _ws_loop(symbols, seconds, streams_for, table, cols, build, proxy, base) -> None:
@@ -54,9 +64,22 @@ async def _ws_loop(symbols, seconds, streams_for, table, cols, build, proxy, bas
 
     async def flush() -> None:
         nonlocal buf
-        if buf:
-            rows, buf = buf, []
-            await loop.run_in_executor(None, ch.insert, client, table, rows, cols)
+        if not buf:
+            return
+        rows, buf = buf, []
+        # Retry transient CH errors (e.g. "Unexpected Http Driver Exception" during
+        # the daily archive load) before giving up. On final failure the exception
+        # propagates out of flusher() and is surfaced (worker exits, supervisor restarts).
+        for attempt in range(FLUSH_RETRIES):
+            try:
+                await loop.run_in_executor(None, ch.insert, client, table, rows, cols)
+                return
+            except Exception as e:
+                if attempt == FLUSH_RETRIES - 1:
+                    raise
+                print(f"[{table} pid={os.getpid()}] insert retry {attempt + 1}/"
+                      f"{FLUSH_RETRIES} after error: {e}", flush=True)
+                await asyncio.sleep(FLUSH_RETRY_BACKOFF * (attempt + 1))
 
     async def flusher() -> None:
         # flush on whichever comes first: LIVE_FLUSH_SECS elapsed, or buf hits
@@ -72,11 +95,20 @@ async def _ws_loop(symbols, seconds, streams_for, table, cols, build, proxy, bas
 
     streams = [s for sym in symbols for s in streams_for(sym)]
     ft = asyncio.create_task(flusher())
+    st = asyncio.create_task(
+        wsmanager.stream(streams, handle, stop, proxy=proxy, base=base))
     try:
-        await wsmanager.stream(streams, handle, stop, proxy=proxy, base=base)
+        # Wait on the stream AND the flusher: if the flusher dies (unrecoverable CH
+        # insert failure) we must NOT keep streaming into a buffer nobody drains
+        # (the full.wait() high-water path would deadlock). Surface it so the worker
+        # exits and the supervisor restarts it.
+        done, _ = await asyncio.wait({st, ft}, return_when=asyncio.FIRST_COMPLETED)
+        if ft in done and not ft.cancelled() and ft.exception() is not None:
+            raise ft.exception()  # type: ignore[misc]
     finally:
         stop.set()
         ft.cancel()
+        st.cancel()
         await flush()
 
 
@@ -120,6 +152,69 @@ def _chunk(xs: list, n: int) -> list[list]:
     return [xs[i::n] for i in range(n)]
 
 
+# A worker slot: how to (re)build its process, plus a human label for logging.
+WorkerSpec = tuple  # (target: Callable, args: tuple, label: str)
+
+
+def _spawn(spec: WorkerSpec) -> mp.Process:
+    target, args, _label = spec
+    p = mp.Process(target=target, args=args)
+    p.start()
+    return p
+
+
+def _supervise(
+    specs: list[WorkerSpec],
+    spawn=_spawn,
+    poll: float = SUPERVISE_POLL,
+    stop_after=None,
+    sleep=time.sleep,
+    now=time.monotonic,
+) -> None:
+    """Run-forever supervisor: start every slot, re-spawn any that die.
+
+    Each slot gets bounded per-slot backoff so a worker that crashes instantly on a
+    persistent error doesn't hot-loop; a slot that stays alive `RESPAWN_BACKOFF_RESET`s
+    resets its backoff. `stop_after(iteration)` (test hook) returns True to break the
+    loop; in production it is None (loop forever). `spawn`/`sleep`/`now` are injectable
+    so the loop is unit-testable without real processes or wall-clock waits.
+    """
+    procs = [spawn(s) for s in specs]
+    backoff = [RESPAWN_BACKOFF_START] * len(specs)
+    started = [now()] * len(specs)
+    next_try = [0.0] * len(specs)  # earliest monotonic time we may re-spawn a slot
+    try:
+        it = 0
+        while True:
+            if stop_after is not None and stop_after(it):
+                break
+            t = now()
+            for i, p in enumerate(procs):
+                if p.is_alive():
+                    if t - started[i] >= RESPAWN_BACKOFF_RESET:
+                        backoff[i] = RESPAWN_BACKOFF_START
+                    continue
+                if t < next_try[i]:
+                    continue  # still backing off this slot
+                _target, _args, label = specs[i]
+                print(f"[supervisor] worker '{label}' (pid={p.pid}) died "
+                      f"exitcode={p.exitcode}; re-spawning (backoff={backoff[i]:.0f}s)",
+                      flush=True)
+                procs[i] = spawn(specs[i])
+                started[i] = now()
+                next_try[i] = started[i] + backoff[i]
+                backoff[i] = min(backoff[i] * 2, RESPAWN_BACKOFF_CAP)
+            it += 1
+            sleep(poll)
+    except KeyboardInterrupt:
+        print("\nstopping...", flush=True)
+    finally:
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            p.join()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=None, help="csv list, or demo|core|all")
@@ -150,32 +245,39 @@ def main() -> None:
           f"oi_funding={run_oi_funding}  metrics={run_metrics}  "
           f"seconds={args.seconds or 'forever'}", flush=True)
 
-    procs: list[mp.Process] = []
+    # One spec per worker slot: (target, args, label). The supervisor re-spawns a
+    # slot from its spec when its process dies; smoke-test mode just starts+joins.
+    secs = args.seconds
+    specs: list[WorkerSpec] = []
     if not args.no_orderbook:                          # depth -> Public route
-        procs += [mp.Process(target=_run_orderbook, args=(g, args.seconds)) for g in ob_groups]
+        specs += [(_run_orderbook, (g, secs), f"orderbook-{i}") for i, g in enumerate(ob_groups)]
     if not args.no_klines:                             # @kline_* -> ohlcv (closed only), /market
-        procs += [mp.Process(target=_run_klines, args=(g, args.seconds)) for g in kl_groups]
+        specs += [(_run_klines, (g, secs), f"klines-{i}") for i, g in enumerate(kl_groups)]
     if not args.no_trades:
         if ws_trades:                                  # @aggTrade via /market route (default)
-            procs.append(mp.Process(target=_run_ws_trades, args=(syms, args.seconds)))
+            specs.append((_run_ws_trades, (syms, secs), "ws-trades"))
         else:                                          # REST paginator fallback (--rest-trades)
-            procs.append(mp.Process(target=poll_trades.run, args=(syms, args.seconds)))
+            specs.append((poll_trades.run, (syms, secs), "rest-trades"))
     if run_oi_funding:                                 # real-time open_interest + funding_rate
-        procs.append(mp.Process(target=poll_oi_funding.run, args=(syms, args.seconds)))
+        specs.append((poll_oi_funding.run, (syms, secs), "oi-funding"))
     if run_metrics:
-        procs.append(mp.Process(target=poll_metrics.run, args=(syms, args.seconds)))
+        specs.append((poll_metrics.run, (syms, secs), "metrics"))
 
-    for p in procs:
-        p.start()
-    try:
-        for p in procs:
-            p.join()
-    except KeyboardInterrupt:
-        print("\nstopping...", flush=True)
-        for p in procs:
-            p.terminate()
-        for p in procs:
-            p.join()
+    if secs > 0:
+        # Smoke test: workers are SUPPOSED to exit at the deadline -> no supervision,
+        # keep the original start+join+exit behavior so a clean exit isn't a "crash".
+        procs = [_spawn(s) for s in specs]
+        try:
+            for p in procs:
+                p.join()
+        except KeyboardInterrupt:
+            print("\nstopping...", flush=True)
+            for p in procs:
+                p.terminate()
+            for p in procs:
+                p.join()
+    else:
+        _supervise(specs)                              # run forever: re-spawn dead workers
 
 
 if __name__ == "__main__":
