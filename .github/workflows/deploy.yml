@@ -1,0 +1,81 @@
+name: Deploy to datalake on release
+
+# Continuous deployment: when a release is published on GitHub, the self-hosted
+# runner ON datalake checks out that tag and applies it to the live tick-crawler
+# stack at /mnt/14TB/DATALAKE/crypto/tick-crawler. Runner makes only OUTBOUND
+# connections to GitHub -- no inbound, no firewall change.
+#
+# Safety: docker-compose.yml on datalake is a deliberate deploy-specific variant
+# (mounts ./symbols.json instead of the research tree's relative path, which
+# doesn't exist standalone here) -- it is NEVER overwritten by this workflow.
+# Only crawler + crawler-spot are touched; ClickHouse and other datalake
+# containers (forex, nmt-deribit-data-inject, ...) live in other compose
+# projects and are never referenced here.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch to deploy"
+        required: true
+
+concurrency:
+  group: deploy-datalake-binance
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, datalake-binance]
+    # Gate on the `datalake` GitHub Environment. Add required reviewers to it
+    # (repo Settings -> Environments -> datalake) for a human-approval gate --
+    # the runner executes repo code on a live financial data host.
+    environment: datalake
+    timeout-minutes: 10
+    env:
+      LIVE_DIR: /mnt/14TB/DATALAKE/crypto/tick-crawler
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          REF="${{ github.event.release.tag_name }}"
+          [ -z "$REF" ] && REF="${{ github.event.inputs.ref }}"
+          if [ -z "$REF" ]; then echo "::error::no ref to deploy"; exit 1; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Deploying ref: $REF"
+
+      - name: Checkout released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Sync code into live dir (never touches the datalake-local docker-compose.yml / symbols.json)
+        run: |
+          set -euo pipefail
+          rsync -a \
+            --exclude='.git/' --exclude='.github/' \
+            --exclude='.venv/' --exclude='__pycache__/' --exclude='tests/' \
+            --exclude='*.bak' --exclude='*.bak-*' \
+            --exclude='.env' --exclude='docker-compose.yml' \
+            --exclude='symbols.json' --exclude='backfill.log' \
+            ./ "$LIVE_DIR/"
+
+      - name: Apply compose (crawler + crawler-spot only; idempotent)
+        working-directory: ${{ env.LIVE_DIR }}
+        run: |
+          set -euo pipefail
+          DOCKER="docker"; docker ps >/dev/null 2>&1 || DOCKER="sudo docker"
+          $DOCKER compose up -d --build crawler crawler-spot
+
+      - name: Verify both services are running
+        working-directory: ${{ env.LIVE_DIR }}
+        run: |
+          set -euo pipefail
+          DOCKER="docker"; docker ps >/dev/null 2>&1 || DOCKER="sudo docker"
+          sleep 5
+          for svc in crawler crawler-spot; do
+            state="$($DOCKER compose ps --format json "$svc" | python3 -c 'import sys,json; print(json.loads(sys.stdin.readline())["State"])' 2>/dev/null || echo missing)"
+            echo "$svc: $state"
+            [ "$state" = "running" ] || { echo "::error::$svc is not running (state=$state)"; exit 1; }
+          done
