@@ -9,7 +9,7 @@ name: Deploy to datalake on release
 # (mounts ./symbols.json instead of the research tree's relative path, which
 # doesn't exist standalone here) -- it is NEVER overwritten by this workflow.
 # Only crawler + crawler-spot are touched; ClickHouse and other datalake
-# containers (forex, nmt-deribit-data-inject, ...) live in other compose
+# containers (forex, nmt-quant-data-deribit-inject, ...) live in other compose
 # projects and are never referenced here.
 
 on:
